@@ -35,6 +35,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 
 	dcontext "github.com/docker/distribution/context"
 	"github.com/docker/distribution/registry/client/transport"
@@ -104,6 +105,7 @@ type DriverParameters struct {
 	UserAgent                   string
 	ObjectACL                   string
 	SessionToken                string
+	MpuBlob                     bool
 }
 
 func init() {
@@ -139,7 +141,7 @@ func (factory *s3DriverFactory) Create(parameters map[string]interface{}) (stora
 }
 
 type driver struct {
-	S3                          *s3.S3
+	S3                          s3iface.S3API
 	Bucket                      string
 	ChunkSize                   int64
 	Encrypt                     bool
@@ -150,6 +152,7 @@ type driver struct {
 	RootDirectory               string
 	StorageClass                string
 	ObjectACL                   string
+	MpuBlob                     bool
 }
 
 type baseEmbed struct {
@@ -340,6 +343,23 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		objectACL = objectACLString
 	}
 
+	mpuBlob := false
+	mpuBlobParam := parameters["mpublob"]
+	switch mpuBlobParam := mpuBlobParam.(type) {
+	case string:
+		b, err := strconv.ParseBool(mpuBlobParam)
+		if err != nil {
+			return nil, fmt.Errorf("the mpublob parameter should be a boolean")
+		}
+		mpuBlob = b
+	case bool:
+		mpuBlob = mpuBlobParam
+	case nil:
+		// do nothing
+	default:
+		return nil, fmt.Errorf("the mpublob parameter should be a boolean")
+	}
+
 	sessionToken := ""
 
 	params := DriverParameters{
@@ -362,6 +382,7 @@ func FromParameters(parameters map[string]interface{}) (*Driver, error) {
 		fmt.Sprint(userAgent),
 		objectACL,
 		fmt.Sprint(sessionToken),
+		mpuBlob,
 	}
 
 	return New(params)
@@ -488,6 +509,7 @@ func New(params DriverParameters) (*Driver, error) {
 		RootDirectory:               params.RootDirectory,
 		StorageClass:                params.StorageClass,
 		ObjectACL:                   params.ObjectACL,
+		MpuBlob:                     params.MpuBlob,
 	}
 
 	return &Driver{
@@ -552,45 +574,40 @@ func (d *driver) Reader(ctx context.Context, path string, offset int64) (io.Read
 // at the location designated by "path" after the call to Commit.
 func (d *driver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
 	key := d.s3Path(path)
-	mpuKey := d.mpuKey(key)
 	if !append {
-		// TODO (brianbland): cancel other uploads at this path
-		log.Debugf("create upload with key %s", key)
-		resp, err := d.S3.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
-			Bucket:               aws.String(d.Bucket),
-			Key:                  aws.String(key),
-			ContentType:          d.getContentType(),
-			ACL:                  d.getACL(),
-			ServerSideEncryption: d.getEncryptionMode(),
-			SSEKMSKeyId:          d.getSSEKMSKeyID(),
-			StorageClass:         d.getStorageClass(),
-		})
-		if err != nil {
-			return nil, err
-		}
-		log.Debugf("Writer: CreateMultipartUpload success: upload id is %s; key is %s", *resp.UploadId, key)
-
-		err = d.PutContent(context.Background(), mpuKey, []byte(*resp.UploadId))
-		if err != nil {
-			// it's optional to write the mpu blob, so we can continue if it fails
-			log.Warnf("Writer: failed to write MPU upload id as blob %s: %s", mpuKey, err)
-		}
-		log.Debugf("Writer: wrote MPU upload id %s to blob at %s", *resp.UploadId, mpuKey)
-
-		return d.newWriter(key, *resp.UploadId, nil), nil
+		return d.firstTimeWriter(ctx, path, key)
 	}
+	return d.continuingWriter(ctx, path, key)
+}
 
+func (d *driver) firstTimeWriter(ctx context.Context, path string, key string) (storagedriver.FileWriter, error) {
+	// TODO (brianbland): cancel other uploads at this path
+	log.Debugf("create upload with key %s", key)
+	resp, err := d.S3.CreateMultipartUpload(&s3.CreateMultipartUploadInput{
+		Bucket:               aws.String(d.Bucket),
+		Key:                  aws.String(key),
+		ContentType:          d.getContentType(),
+		ACL:                  d.getACL(),
+		ServerSideEncryption: d.getEncryptionMode(),
+		SSEKMSKeyId:          d.getSSEKMSKeyID(),
+		StorageClass:         d.getStorageClass(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("Writer: CreateMultipartUpload success: upload id is %s; key is %s", *resp.UploadId, key)
+	d.writeMpuBlob(key, resp.UploadId)
+	return d.newWriter(key, *resp.UploadId, nil), nil
+}
+
+func (d *driver) continuingWriter(ctx context.Context, path string, key string) (storagedriver.FileWriter, error) {
 	log.Debugf("continue upload with key %s", key)
-	uploadId := ""
-	uploadIdArray, err := d.GetContent(context.Background(), mpuKey)
-	if err == nil {
-		uploadId = string(uploadIdArray)
-		log.Debugf("successfully got upload id %s from MPU blob", uploadId)
-	} else {
-		log.Warnf("failed to get upload id from blob %s will try using ListMultipartUploads: %s", mpuKey, err)
+	uploadID := d.readMpuBlob(key)
+	if uploadID == "" {
+		log.Debug("did not get upload id from blob will try using ListMultipartUploads")
 		resp, err := d.S3.ListMultipartUploads(&s3.ListMultipartUploadsInput{
-			Bucket:     aws.String(d.Bucket),
-			Prefix:     aws.String(key),
+			Bucket: aws.String(d.Bucket),
+			Prefix: aws.String(key),
 		})
 		if err != nil {
 			return nil, parseError(path, err)
@@ -598,16 +615,17 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 		log.Debugf("from ListMultipartUploads got MPU upload list %v", resp.Uploads)
 		for _, multi := range resp.Uploads {
 			if key == *multi.Key {
-				uploadId = *multi.UploadId
+				uploadID = *multi.UploadId
 				break
 			}
 		}
 	}
-	if uploadId != "" {
+	if uploadID != "" {
+		log.Debugf("got upload id %s", uploadID)
 		resp, err := d.S3.ListParts(&s3.ListPartsInput{
 			Bucket:   aws.String(d.Bucket),
 			Key:      aws.String(key),
-			UploadId: &uploadId,
+			UploadId: &uploadID,
 		})
 		if err != nil {
 			return nil, parseError(path, err)
@@ -616,11 +634,57 @@ func (d *driver) Writer(ctx context.Context, path string, append bool) (storaged
 		for _, part := range resp.Parts {
 			multiSize += *part.Size
 		}
-		return d.newWriter(key, uploadId, resp.Parts), nil
-	} else {
-		log.Errorf("failed to continue MPU for path %s: %s", path, err)
-		return nil, storagedriver.PathNotFoundError{Path: path}
+		return d.newWriter(key, uploadID, resp.Parts), nil
 	}
+	log.Errorf("failed to continue MPU for path %s - unable to find upload id", path)
+	return nil, storagedriver.PathNotFoundError{Path: path}
+}
+
+func (d *driver) writeMpuBlob(key string, uploadID *string) {
+	if !d.MpuBlob {
+		log.Debug("not configured to write MPU blobs")
+		return
+	}
+	mpuKey := mpuKey(key)
+	err := d.PutContent(context.Background(), mpuKey, []byte(*uploadID))
+	if err != nil {
+		// it's optional to write the mpu blob, so we can continue if it fails
+		log.Warnf("failed to write MPU upload id as blob %s: %s", mpuKey, err)
+	}
+	log.Debugf("wrote MPU upload id %s to blob at %s", *uploadID, mpuKey)
+}
+
+func (d *driver) readMpuBlob(key string) string {
+	if !d.MpuBlob {
+		log.Debug("not configured to read MPU blobs")
+		return ""
+	}
+	mpuKey := mpuKey(key)
+	uploadID := ""
+	uploadIDArray, err := d.GetContent(context.Background(), mpuKey)
+	if err == nil {
+		uploadID = string(uploadIDArray)
+		log.Debugf("successfully got upload id %s from MPU blob", uploadID)
+	} else {
+		// it's optional to read the mpu blob, so we can continue if it fails
+		log.Warnf("failed to read blob for MPU key %s: %s", mpuKey, err)
+		uploadID = ""
+	}
+	return uploadID
+}
+
+func (d *driver) deleteMpuBlob(key string) {
+	if !d.MpuBlob {
+		log.Debug("not configured to delete MPU blobs")
+		return
+	}
+	mpuKey := mpuKey(key)
+	err := d.deleteSingleObject(context.Background(), mpuKey)
+	if err != nil {
+		// it's optional to delete the mpu blob, so we can continue if it fails
+		log.Warnf("failed to delete blob for MPU key %s: %s", mpuKey, err)
+	}
+
 }
 
 // Stat retrieves the FileInfo for the given path, including the current size
@@ -890,7 +954,7 @@ ListLoop:
 func (d *driver) deleteSingleObject(ctx context.Context, path string) error {
 	_, err := d.S3.DeleteObject(&s3.DeleteObjectInput{
 		Bucket: aws.String(d.Bucket),
-		Key: &path,
+		Key:    &path,
 	})
 	if err != nil {
 		log.Warnf("failed to delete object %s: %s", path, err)
@@ -1086,7 +1150,7 @@ func (d *driver) s3Path(path string) string {
 	return strings.TrimLeft(strings.TrimRight(d.RootDirectory, "/")+path, "/")
 }
 
-func (d *driver) mpuKey(path string) string {
+func mpuKey(path string) string {
 	return path + "+mpu"
 }
 
@@ -1203,8 +1267,7 @@ func (w *writer) Write(p []byte) (int, error) {
 			},
 		})
 
-		mpuKey := w.driver.mpuKey(w.key)
-		_ = w.driver.deleteSingleObject(context.Background(), mpuKey)
+		w.driver.deleteMpuBlob(w.key)
 
 		if err != nil {
 			_, _ = w.driver.S3.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
@@ -1228,13 +1291,7 @@ func (w *writer) Write(p []byte) (int, error) {
 		}
 		log.Debugf("Write: CreateMultipartUpload success: upload id is %s; key is %s", *resp.UploadId, w.key)
 
-
-		err = w.driver.PutContent(context.Background(), mpuKey, []byte(*resp.UploadId))
-		if err != nil {
-			// it's optional to write the mpu blob, so we can continue if it fails
-			log.Warnf("Write: failed to write MPU upload id as blob %s: %s", mpuKey, err)
-		}
-		log.Debugf("Write: wrote MPU upload id %s to blob at %s", *resp.UploadId, mpuKey)
+		w.driver.writeMpuBlob(w.key, resp.UploadId)
 
 		w.uploadID = *resp.UploadId
 
@@ -1337,8 +1394,7 @@ func (w *writer) Cancel() error {
 		Key:      aws.String(w.key),
 		UploadId: aws.String(w.uploadID),
 	})
-	_ = w.driver.deleteSingleObject(context.Background(), w.driver.mpuKey(w.key))
-
+	w.driver.deleteMpuBlob(w.key)
 	return err
 }
 
@@ -1375,7 +1431,7 @@ func (w *writer) Commit() error {
 		},
 	})
 
-	_ = w.driver.deleteSingleObject(context.Background(), w.driver.mpuKey(w.key))
+	w.driver.deleteMpuBlob(w.key)
 
 	if err != nil {
 		_, _ = w.driver.S3.AbortMultipartUpload(&s3.AbortMultipartUploadInput{

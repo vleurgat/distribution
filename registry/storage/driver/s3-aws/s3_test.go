@@ -2,19 +2,23 @@ package s3
 
 import (
 	"bytes"
+	"errors"
 	"io/ioutil"
 	"math/rand"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 
 	"gopkg.in/check.v1"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/golang/mock/gomock"
 
 	"github.com/docker/distribution/context"
 	storagedriver "github.com/docker/distribution/registry/storage/driver"
+	"github.com/docker/distribution/registry/storage/driver/s3-aws/mock_s3iface"
 	"github.com/docker/distribution/registry/storage/driver/testsuites"
 )
 
@@ -38,6 +42,7 @@ func init() {
 	root, err := ioutil.TempDir("", "driver-")
 	regionEndpoint := os.Getenv("REGION_ENDPOINT")
 	sessionToken := os.Getenv("AWS_SESSION_TOKEN")
+	mpuBlobEnv := os.Getenv("MPU_BLOB")
 	if err != nil {
 		panic(err)
 	}
@@ -76,6 +81,14 @@ func init() {
 			}
 		}
 
+		mpuBlob := false
+		if mpuBlobEnv != "" {
+			mpuBlob, err = strconv.ParseBool(mpuBlobEnv)
+			if err != nil {
+				return nil, err
+			}
+		}
+
 		parameters := DriverParameters{
 			accessKey,
 			secretKey,
@@ -96,6 +109,7 @@ func init() {
 			driverName + "-test",
 			objectACL,
 			sessionToken,
+			mpuBlob,
 		}
 
 		return New(parameters)
@@ -322,4 +336,153 @@ func TestMoveWithMultipartCopy(t *testing.T) {
 	default:
 		t.Fatalf("unexpected error getting content: %v", err)
 	}
+}
+
+func TestMpuKey(t *testing.T) {
+	mpuKey := mpuKey("hello")
+	if mpuKey != "hello+mpu" {
+		t.Fatalf("unexpected MPU key: %s", mpuKey)
+	}
+}
+
+func TestWriteMpuBlob_Disabled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ms3 := mock_s3iface.NewMockS3API(ctrl)
+
+	d := &driver{
+		S3:      ms3,
+		MpuBlob: false,
+	}
+
+	data := "some data"
+	ms3.EXPECT().PutObject(gomock.Any()).Return(nil, nil).Times(0)
+	d.writeMpuBlob("mympukey", &data)
+}
+
+func TestWriteMpuBlob_Enabled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ms3 := mock_s3iface.NewMockS3API(ctrl)
+
+	d := &driver{
+		S3:      ms3,
+		MpuBlob: true,
+	}
+
+	data := "some data"
+	ms3.EXPECT().PutObject(gomock.Any()).Return(nil, nil).Times(1)
+	d.writeMpuBlob("mympukey", &data)
+}
+
+func TestWriteMpuBlob_Enabled_Failure(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ms3 := mock_s3iface.NewMockS3API(ctrl)
+
+	d := &driver{
+		S3:      ms3,
+		MpuBlob: true,
+	}
+
+	data := "some data"
+	ms3.EXPECT().PutObject(gomock.Any()).Return(nil, errors.New("test")).Times(1)
+	d.writeMpuBlob("mympukey", &data)
+}
+func TestReadMpuBlob_Disabled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ms3 := mock_s3iface.NewMockS3API(ctrl)
+
+	d := &driver{
+		S3:      ms3,
+		MpuBlob: false,
+	}
+
+	ms3.EXPECT().GetObject(gomock.Any()).Return(nil, nil).Times(0)
+	if d.readMpuBlob("mympukey") != "" {
+		t.Fatal("expected to get an empty string result")
+	}
+}
+
+func TestReadMpuBlob_Enabled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ms3 := mock_s3iface.NewMockS3API(ctrl)
+
+	d := &driver{
+		S3:      ms3,
+		MpuBlob: true,
+	}
+
+	resp := s3.GetObjectOutput{
+		Body: ioutil.NopCloser(strings.NewReader("hello")),
+	}
+
+	ms3.EXPECT().GetObject(gomock.Any()).Return(&resp, nil).Times(1)
+	if d.readMpuBlob("mympukey") != "hello" {
+		t.Fatal("expected to get 'hello' as the result")
+	}
+}
+
+func TestReadMpuBlob_Enabled_Failure(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ms3 := mock_s3iface.NewMockS3API(ctrl)
+
+	d := &driver{
+		S3:      ms3,
+		MpuBlob: true,
+	}
+
+	resp := s3.GetObjectOutput{
+		Body: ioutil.NopCloser(strings.NewReader("hello")),
+	}
+
+	ms3.EXPECT().GetObject(gomock.Any()).Return(&resp, errors.New("test")).Times(1)
+	if d.readMpuBlob("mympukey") != "" {
+		t.Fatal("expected to get an empty string result")
+	}
+}
+
+func TestDeleteMpuBlob_Disabled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ms3 := mock_s3iface.NewMockS3API(ctrl)
+
+	d := &driver{
+		S3:      ms3,
+		MpuBlob: false,
+	}
+
+	ms3.EXPECT().DeleteObject(gomock.Any()).Return(nil, nil).Times(0)
+	d.deleteMpuBlob("mympukey")
+}
+
+func TestDeleteMpuBlob_Enabled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ms3 := mock_s3iface.NewMockS3API(ctrl)
+
+	d := &driver{
+		S3:      ms3,
+		MpuBlob: true,
+	}
+
+	ms3.EXPECT().DeleteObject(gomock.Any()).Return(nil, nil).Times(1)
+	d.deleteMpuBlob("mympukey")
+}
+
+func TestDeleteMpuBlob_Enabled_Failure(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	ms3 := mock_s3iface.NewMockS3API(ctrl)
+
+	d := &driver{
+		S3:      ms3,
+		MpuBlob: true,
+	}
+
+	ms3.EXPECT().DeleteObject(gomock.Any()).Return(nil, errors.New("test")).Times(1)
+	d.deleteMpuBlob("mympukey")
 }

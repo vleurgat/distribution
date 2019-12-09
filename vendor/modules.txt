@@ -71,6 +71,8 @@ github.com/garyburd/redigo/redis
 github.com/garyburd/redigo/internal
 # github.com/go-ini/ini v1.25.4
 github.com/go-ini/ini
+# github.com/golang/mock
+github.com/golang/mock v1.3.1
 # github.com/golang/protobuf v1.2.0
 github.com/golang/protobuf/proto
 # github.com/gorilla/handlers v0.0.0-20150720190736-60c7bfde3e33
